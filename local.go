@@ -2,7 +2,6 @@ package jiffy
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/dgraph-io/ristretto/v2"
@@ -42,7 +41,7 @@ func (c LocalCache[T]) Get(_ context.Context, key string) (T, error) {
 	if v, found := c.impl.Get(key); found {
 		return v, nil
 	}
-	return *new(T), errors.New("object not found")
+	return *new(T), ErrNotFound
 }
 
 // Close closes the cache.

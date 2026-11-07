@@ -17,8 +17,10 @@ import (
 type fakeCache struct {
 	mu       sync.Mutex
 	data     map[string]string
+	gets     atomic.Int32
 	sets     atomic.Int32
 	closed   atomic.Int32
+	getErr   error
 	closeErr error
 	setDelay time.Duration
 }
@@ -28,12 +30,16 @@ func newFakeCache() *fakeCache {
 }
 
 func (f *fakeCache) Get(_ context.Context, key string) (string, error) {
+	f.gets.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return "", f.getErr
+	}
 	if v, ok := f.data[key]; ok {
 		return v, nil
 	}
-	return "", errors.New("object not found")
+	return "", ErrNotFound
 }
 
 func (f *fakeCache) Set(_ context.Context, key string, value string) error {

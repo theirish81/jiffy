@@ -7,6 +7,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/dgraph-io/ristretto/v2"
 )
 
 // defaultSpreadTimeout is the default timeout for the spread worker.
@@ -15,14 +17,13 @@ const defaultSpreadTimeout = 5 * time.Second
 // defaultSpreadBufferSize is the default buffer size for the spread worker.
 const defaultSpreadBufferSize = 100
 
-// ErrClosed is returned when operating on a cache that has been closed.
-var ErrClosed = errors.New("cache is closed")
-
 // CacheOptions are options for a cache.
 type CacheOptions struct {
 	spreadBufferSize int
 	spreadTimeout    time.Duration
 	logger           *slog.Logger
+	missCacheSize    int
+	missCacheTTL     time.Duration
 }
 
 // CacheOption is an option for a cache.
@@ -49,6 +50,21 @@ func WithLogger(l *slog.Logger) CacheOption {
 	}
 }
 
+// WithMissCache enables miss caching. When a key is not found in any of the caches, the miss is remembered locally
+// for ttl, and subsequent Gets for that key return ErrNotFound without querying the caches. This is useful when
+// lower caches are remote (e.g. Redis) and most lookups are expected to miss.
+// maxItems is the maximum number of misses to remember. ttl is how long a miss is remembered.
+// Miss caching is disabled by default, and is also disabled if maxItems or ttl are not positive.
+//
+// A Set on this CompositeCache clears the miss for its key immediately. Values written to the underlying caches by
+// other means (e.g. another process writing to a shared Redis) become visible only once the miss expires.
+func WithMissCache(maxItems int, ttl time.Duration) CacheOption {
+	return func(c *CacheOptions) {
+		c.missCacheSize = maxItems
+		c.missCacheTTL = ttl
+	}
+}
+
 // compositeState holds the mutable lifecycle state of a CompositeCache. It is shared by pointer so that copies of
 // a CompositeCache value all observe the same closed state.
 type compositeState struct {
@@ -66,6 +82,8 @@ type CompositeCache[T any] struct {
 	ch     chan spreadCommand[T]
 	opts   CacheOptions
 	state  *compositeState
+	// misses remembers keys not found in any cache. nil when miss caching is disabled.
+	misses *ristretto.Cache[string, struct{}]
 }
 
 // NewCompositeCache creates a new composite cache.
@@ -85,6 +103,19 @@ func NewCompositeCache[T any](caches []Cache[T], options ...CacheOption) Composi
 		option(&cache.opts)
 	}
 	cache.caches = caches
+	if cache.opts.missCacheSize > 0 && cache.opts.missCacheTTL > 0 {
+		misses, err := ristretto.NewCache[string, struct{}](&ristretto.Config[string, struct{}]{
+			NumCounters:        int64(cache.opts.missCacheSize * 10),
+			MaxCost:            int64(cache.opts.missCacheSize),
+			BufferItems:        64,
+			IgnoreInternalCost: true,
+		})
+		if err != nil {
+			// Only reachable with an invalid config, which the guard above rules out.
+			panic("jiffy: could not create miss cache: " + err.Error())
+		}
+		cache.misses = misses
+	}
 	cache.ch = make(chan spreadCommand[T], cache.opts.spreadBufferSize)
 	cache.state = &compositeState{done: make(chan struct{})}
 	cache.startSpreadWorker(cache.ch)
@@ -99,36 +130,57 @@ type spreadCommand[T any] struct {
 }
 
 // Get gets the value for the given key. The first cache to return a value is returned. If a cached value is found,
-// the value is spread to all caches.
+// the value is spread to all caches. If miss caching is enabled and the key is not found in any cache, the miss is
+// remembered.
 func (c CompositeCache[T]) Get(ctx context.Context, key string) (T, error) {
 	c.state.mu.RLock()
 	defer c.state.mu.RUnlock()
 	if c.state.closed {
 		return *new(T), ErrClosed
 	}
-	for idx, cache := range c.caches {
-		if v, err := cache.Get(ctx, key); err == nil {
-			c.opts.logger.Debug("cache hit", "index", idx)
-			if idx > 0 {
-				select {
-				case c.ch <- spreadCommand[T]{key: key, value: v, idx: idx}:
-					c.opts.logger.Debug("spread command sent", "index", idx)
-				default:
-					c.opts.logger.Warn("spread command dropped. Channel full", "index", idx)
-				}
-			}
-			return v, nil
+	if c.misses != nil {
+		if _, found := c.misses.Get(key); found {
+			c.opts.logger.Debug("miss cache hit")
+			return *new(T), ErrNotFound
 		}
 	}
-	return *new(T), errors.New("object not found")
+	allNotFound := true
+	for idx, cache := range c.caches {
+		v, err := cache.Get(ctx, key)
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				allNotFound = false
+			}
+			continue
+		}
+		c.opts.logger.Debug("cache hit", "index", idx)
+		if idx > 0 {
+			select {
+			case c.ch <- spreadCommand[T]{key: key, value: v, idx: idx}:
+				c.opts.logger.Debug("spread command sent", "index", idx)
+			default:
+				c.opts.logger.Warn("spread command dropped. Channel full", "index", idx)
+			}
+		}
+		return v, nil
+	}
+	// Only remember genuine misses: if a cache failed, the key may well exist there.
+	if c.misses != nil && allNotFound {
+		c.misses.SetWithTTL(key, struct{}{}, 1, c.opts.missCacheTTL)
+	}
+	return *new(T), ErrNotFound
 }
 
-// Set sets the value for the given key. The value is spread to all caches.
+// Set sets the value for the given key. The value is spread to all caches, and any remembered miss for the key is
+// cleared.
 func (c CompositeCache[T]) Set(ctx context.Context, key string, value T) error {
 	c.state.mu.RLock()
 	defer c.state.mu.RUnlock()
 	if c.state.closed {
 		return ErrClosed
+	}
+	if c.misses != nil {
+		c.misses.Del(key)
 	}
 	return c.spread(ctx, key, value, len(c.caches))
 }
@@ -178,6 +230,9 @@ func (c CompositeCache[T]) Close(ctx context.Context) error {
 		c.opts.logger.Warn("timed out waiting for spread worker to drain", "err", ctx.Err())
 	}
 
+	if c.misses != nil {
+		c.misses.Close()
+	}
 	var errs []error
 	for _, cache := range c.caches {
 		if err := cache.Close(ctx); err != nil {

@@ -2,6 +2,7 @@ package jiffy
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -42,8 +43,11 @@ func (c RedisCache[T]) Set(ctx context.Context, key string, value T) error {
 // Get gets the value for the given key.
 func (c RedisCache[T]) Get(ctx context.Context, key string) (T, error) {
 	cmd := c.impl.Get(ctx, key)
-	if cmd.Err() != nil {
-		return *new(T), cmd.Err()
+	if err := cmd.Err(); err != nil {
+		if errors.Is(err, redis.Nil) {
+			return *new(T), ErrNotFound
+		}
+		return *new(T), err
 	}
 	var value T
 	err := cmd.Scan(&value)
