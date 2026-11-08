@@ -9,13 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// getAndSettle performs a Get and waits for the miss cache's async buffer to apply, so that tests are deterministic.
+// getAndSettle performs a Get. The miss cache is a LocalCache, whose writes are applied before they return, so no
+// extra settling is needed.
 func getAndSettle(cache CompositeCache[string], key string) (string, error) {
-	v, err := cache.Get(context.Background(), key)
-	if cache.misses != nil {
-		cache.misses.Wait()
-	}
-	return v, err
+	return cache.Get(context.Background(), key)
 }
 
 func TestMissCache_DisabledByDefault(t *testing.T) {
