@@ -132,6 +132,7 @@ The `CompositeCache` can be configured with a few options:
 - `WithSpreadBufferSize(size int)`: Sets the buffer size for the spread worker (default: 100).
 - `WithSpreadTimeout(d time.Duration)`: Sets the timeout for the spread worker (default: 5 seconds).
 - `WithLogger(l *slog.Logger)`: Sets the logger for the cache.
+- `WithMissCache(maxItems int, ttl time.Duration)`: Enables miss caching (default: off). See below.
 
 Example:
 
@@ -147,3 +148,29 @@ cache := jiffy.NewCompositeCache[string](
     jiffy.WithLogger(slog.Default()),
 )
 ```
+
+#### Miss Caching
+
+By default, a key that is in none of the caches is looked up in every cache, every time. When the lower caches are
+remote (e.g. Redis) and most lookups are expected to miss, that means a network round trip per lookup.
+
+With `WithMissCache`, a key that every cache reports as missing is remembered in memory for `ttl`, and further `Get`s
+for it return `jiffy.ErrNotFound` straight away:
+
+```go
+cache := jiffy.NewCompositeCache[string](
+    []jiffy.Cache[string]{local, redis},
+    jiffy.WithMissCache(10_000, 2*time.Second),
+)
+```
+
+- Only genuine misses are remembered: if any cache returns an error other than `ErrNotFound` (e.g. Redis is down),
+  the miss is not cached.
+- `Set` on the composite cache clears the remembered miss for that key immediately.
+- Values written to a shared cache by another process (e.g. another replica writing to Redis) become visible once the
+  miss expires, so `ttl` bounds how stale a "not found" can be.
+
+#### Errors
+
+`Get` returns `jiffy.ErrNotFound` when a key is not in the cache, so misses can be told apart from failures with
+`errors.Is(err, jiffy.ErrNotFound)`. Operations on a closed `CompositeCache` return `jiffy.ErrClosed`.
