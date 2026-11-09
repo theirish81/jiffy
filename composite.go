@@ -70,8 +70,11 @@ type CompositeCache[T any] struct {
 	// share the same closed state.
 	spreads *backgroundQueue[spreadCommand[T]]
 	// misses remembers keys not found in any cache. nil when miss caching is disabled.
-	misses *LocalCache[struct{}]
+	misses *LocalCache[miss]
 }
+
+// miss is the value stored in the miss cache: only the presence of a key matters.
+type miss struct{}
 
 // NewCompositeCache creates a new composite cache.
 // caches is the list of caches to use.
@@ -91,7 +94,7 @@ func NewCompositeCache[T any](caches []Cache[T], options ...CacheOption) Composi
 	}
 	cache.caches = caches
 	if cache.opts.missCacheSize > 0 && cache.opts.missCacheTTL > 0 {
-		misses, err := NewLocalCache[struct{}](cache.opts.missCacheSize, cache.opts.missCacheTTL)
+		misses, err := NewLocalCache[miss](cache.opts.missCacheSize, cache.opts.missCacheTTL)
 		if err != nil {
 			// Only reachable with an invalid config, which the guard above rules out.
 			panic("jiffy: could not create miss cache: " + err.Error())
@@ -149,7 +152,7 @@ func (c CompositeCache[T]) Get(ctx context.Context, key string) (T, error) {
 	}
 	// Only remember genuine misses: if a cache failed, the key may well exist there.
 	if c.misses != nil && allNotFound {
-		_ = c.misses.Set(ctx, key, struct{}{}) // LocalCache.Set never fails
+		_ = c.misses.Set(ctx, key, miss{}) // LocalCache.Set never fails
 	}
 	return *new(T), ErrNotFound
 }
