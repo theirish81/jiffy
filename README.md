@@ -133,7 +133,7 @@ The `CompositeCache` can be configured with a few options:
 
 - `WithSpreadBufferSize(size int)`: Sets the buffer size for the spread worker (default: 100).
 - `WithSpreadTimeout(d time.Duration)`: Sets the timeout for the spread worker (default: 5 seconds).
-- `WithLogger(l *slog.Logger)`: Sets the logger for the cache.
+- `WithLogger(l *slog.Logger)`: Sets the logger for the cache (default: `slog.Default()`).
 - `WithMissCache(maxItems int, ttl time.Duration)`: Enables miss caching (default: off). See below.
 
 Example:

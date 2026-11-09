@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"time"
 )
 
@@ -69,8 +68,9 @@ type CompositeCache[T any] struct {
 	// spreads runs spread commands in the background. It is a pointer, so that copies of a CompositeCache value all
 	// share the same closed state.
 	spreads *backgroundQueue[spreadCommand[T]]
-	// misses remembers keys not found in any cache. nil when miss caching is disabled.
-	misses *LocalCache[miss]
+	// misses remembers keys not found in any cache. When miss caching is disabled, it is the zero LocalCache, which
+	// holds nothing and ignores writes.
+	misses LocalCache[miss]
 }
 
 // miss is the value stored in the miss cache: only the presence of a key matters.
@@ -84,10 +84,7 @@ func NewCompositeCache[T any](caches []Cache[T], options ...CacheOption) Composi
 	cache.opts = CacheOptions{
 		spreadTimeout:    defaultSpreadTimeout,
 		spreadBufferSize: defaultSpreadBufferSize,
-		logger: slog.New(
-			slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-				Level: slog.LevelDebug,
-			})),
+		logger:           slog.Default(),
 	}
 	for _, option := range options {
 		option(&cache.opts)
@@ -99,7 +96,7 @@ func NewCompositeCache[T any](caches []Cache[T], options ...CacheOption) Composi
 			// Only reachable with an invalid config, which the guard above rules out.
 			panic("jiffy: could not create miss cache: " + err.Error())
 		}
-		cache.misses = &misses
+		cache.misses = misses
 	}
 	cache.spreads = newBackgroundQueue(cache.opts.spreadBufferSize, 1, cache.opts.spreadTimeout,
 		func(ctx context.Context, cmd spreadCommand[T]) {
@@ -125,11 +122,9 @@ func (c CompositeCache[T]) Get(ctx context.Context, key string) (T, error) {
 		return *new(T), ErrClosed
 	}
 	defer c.spreads.exit()
-	if c.misses != nil {
-		if _, err := c.misses.Get(ctx, key); err == nil {
-			c.opts.logger.Debug("miss cache hit")
-			return *new(T), ErrNotFound
-		}
+	if _, err := c.misses.Get(ctx, key); err == nil {
+		c.opts.logger.Debug("miss cache hit")
+		return *new(T), ErrNotFound
 	}
 	allNotFound := true
 	for idx, cache := range c.caches {
@@ -151,7 +146,7 @@ func (c CompositeCache[T]) Get(ctx context.Context, key string) (T, error) {
 		return v, nil
 	}
 	// Only remember genuine misses: if a cache failed, the key may well exist there.
-	if c.misses != nil && allNotFound {
+	if allNotFound {
 		_ = c.misses.Set(ctx, key, miss{}) // LocalCache.Set never fails
 	}
 	return *new(T), ErrNotFound
@@ -164,9 +159,7 @@ func (c CompositeCache[T]) Set(ctx context.Context, key string, value T) error {
 		return ErrClosed
 	}
 	defer c.spreads.exit()
-	if c.misses != nil {
-		_ = c.misses.Delete(ctx, key) // LocalCache.Delete never fails
-	}
+	_ = c.misses.Delete(ctx, key) // LocalCache.Delete never fails
 	return c.spread(ctx, key, value, len(c.caches))
 }
 
@@ -187,9 +180,7 @@ func (c CompositeCache[T]) Delete(ctx context.Context, key string) error {
 			errs = append(errs, err)
 		}
 	}
-	if c.misses != nil {
-		_ = c.misses.Delete(ctx, key) // LocalCache.Delete never fails
-	}
+	_ = c.misses.Delete(ctx, key) // LocalCache.Delete never fails
 	return errors.Join(errs...)
 }
 
@@ -214,9 +205,7 @@ func (c CompositeCache[T]) Close(ctx context.Context) error {
 		c.opts.logger.Warn("timed out waiting for spread worker to drain", "err", err)
 	}
 
-	if c.misses != nil {
-		_ = c.misses.Close(ctx) // LocalCache.Close never fails
-	}
+	_ = c.misses.Close(ctx) // LocalCache.Close never fails
 	var errs []error
 	for _, cache := range c.caches {
 		if err := cache.Close(ctx); err != nil {

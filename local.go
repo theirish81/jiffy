@@ -18,6 +18,9 @@ const localCounterStripes = 64
 // Like in Redis, values and counters share one key space: a counter is a key holding an int64, so on a
 // LocalCache[int64], Get reads a counter and Incr adds to a value written by Set. Unlike Redis, a key may be evicted
 // when the cache is full, counters included.
+//
+// The zero LocalCache holds nothing and ignores writes: Get returns ErrNotFound, Set, Delete and Close do nothing.
+// Incr and Count must not be used on it.
 type LocalCache[T any] struct {
 	impl *ristretto.Cache[string, any]
 	ttl  time.Duration
