@@ -9,13 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// getAndSettle performs a Get and waits for the miss cache's async buffer to apply, so that tests are deterministic.
+// getAndSettle performs a Get. The miss cache is a LocalCache, whose writes are applied before they return, so no
+// extra settling is needed.
 func getAndSettle(cache CompositeCache[string], key string) (string, error) {
-	v, err := cache.Get(context.Background(), key)
-	if cache.misses != nil {
-		cache.misses.Wait()
-	}
-	return v, err
+	return cache.Get(context.Background(), key)
 }
 
 func TestMissCache_DisabledByDefault(t *testing.T) {
@@ -33,7 +30,7 @@ func TestMissCache_DisabledByDefault(t *testing.T) {
 func TestMissCache_DisabledWithNonPositiveValues(t *testing.T) {
 	for _, opt := range []CacheOption{WithMissCache(0, time.Second), WithMissCache(10, 0)} {
 		cache := NewCompositeCache[string]([]Cache[string]{newFakeCache()}, quietLogger(), opt)
-		assert.Nil(t, cache.misses)
+		assert.Nil(t, cache.misses.impl)
 		assert.Nil(t, cache.Close(context.Background()))
 	}
 }
@@ -98,6 +95,17 @@ func TestMissCache_DoesNotRememberFailures(t *testing.T) {
 	v, err := getAndSettle(cache, "k")
 	assert.Nil(t, err)
 	assert.Equal(t, "v", v)
+}
+
+// The composite cache relies on this to disable miss caching without nil checks.
+func TestLocalCache_ZeroValueHoldsNothing(t *testing.T) {
+	var local LocalCache[string]
+	ctx := context.Background()
+	assert.NoError(t, local.Set(ctx, "k", "v"))
+	_, err := local.Get(ctx, "k")
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.NoError(t, local.Delete(ctx, "k"))
+	assert.NoError(t, local.Close(ctx))
 }
 
 func TestLocalCache_ReturnsErrNotFound(t *testing.T) {

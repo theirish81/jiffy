@@ -4,11 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
-	"sync"
 	"time"
-
-	"github.com/dgraph-io/ristretto/v2"
 )
 
 // defaultSpreadTimeout is the default timeout for the spread worker.
@@ -65,26 +61,20 @@ func WithMissCache(maxItems int, ttl time.Duration) CacheOption {
 	}
 }
 
-// compositeState holds the mutable lifecycle state of a CompositeCache. It is shared by pointer so that copies of
-// a CompositeCache value all observe the same closed state.
-type compositeState struct {
-	// mu guards closed. Operations hold the read lock for their whole duration, so Close (which takes the write
-	// lock) waits for in-flight operations to finish and no operation can send on the channel after it is closed.
-	mu     sync.RWMutex
-	closed bool
-	// done is closed when the spread worker has drained the channel and exited.
-	done chan struct{}
-}
-
 // CompositeCache is a cache backed by a cascade of caches.
 type CompositeCache[T any] struct {
 	caches []Cache[T]
-	ch     chan spreadCommand[T]
 	opts   CacheOptions
-	state  *compositeState
-	// misses remembers keys not found in any cache. nil when miss caching is disabled.
-	misses *ristretto.Cache[string, struct{}]
+	// spreads runs spread commands in the background. It is a pointer, so that copies of a CompositeCache value all
+	// share the same closed state.
+	spreads *backgroundQueue[spreadCommand[T]]
+	// misses remembers keys not found in any cache. When miss caching is disabled, it is the zero LocalCache, which
+	// holds nothing and ignores writes.
+	misses LocalCache[miss]
 }
+
+// miss is the value stored in the miss cache: only the presence of a key matters.
+type miss struct{}
 
 // NewCompositeCache creates a new composite cache.
 // caches is the list of caches to use.
@@ -94,31 +84,26 @@ func NewCompositeCache[T any](caches []Cache[T], options ...CacheOption) Composi
 	cache.opts = CacheOptions{
 		spreadTimeout:    defaultSpreadTimeout,
 		spreadBufferSize: defaultSpreadBufferSize,
-		logger: slog.New(
-			slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-				Level: slog.LevelDebug,
-			})),
+		logger:           slog.Default(),
 	}
 	for _, option := range options {
 		option(&cache.opts)
 	}
 	cache.caches = caches
 	if cache.opts.missCacheSize > 0 && cache.opts.missCacheTTL > 0 {
-		misses, err := ristretto.NewCache[string, struct{}](&ristretto.Config[string, struct{}]{
-			NumCounters:        int64(cache.opts.missCacheSize * 10),
-			MaxCost:            int64(cache.opts.missCacheSize),
-			BufferItems:        64,
-			IgnoreInternalCost: true,
-		})
+		misses, err := NewLocalCache[miss](cache.opts.missCacheSize, cache.opts.missCacheTTL)
 		if err != nil {
 			// Only reachable with an invalid config, which the guard above rules out.
 			panic("jiffy: could not create miss cache: " + err.Error())
 		}
 		cache.misses = misses
 	}
-	cache.ch = make(chan spreadCommand[T], cache.opts.spreadBufferSize)
-	cache.state = &compositeState{done: make(chan struct{})}
-	cache.startSpreadWorker(cache.ch)
+	cache.spreads = newBackgroundQueue(cache.opts.spreadBufferSize, 1, cache.opts.spreadTimeout,
+		func(ctx context.Context, cmd spreadCommand[T]) {
+			if err := cache.spread(ctx, cmd.key, cmd.value, cmd.idx); err != nil {
+				cache.opts.logger.Error("could not spread cache", "err", err.Error())
+			}
+		})
 	return cache
 }
 
@@ -133,16 +118,13 @@ type spreadCommand[T any] struct {
 // the value is spread to all caches. If miss caching is enabled and the key is not found in any cache, the miss is
 // remembered.
 func (c CompositeCache[T]) Get(ctx context.Context, key string) (T, error) {
-	c.state.mu.RLock()
-	defer c.state.mu.RUnlock()
-	if c.state.closed {
+	if !c.spreads.enter() {
 		return *new(T), ErrClosed
 	}
-	if c.misses != nil {
-		if _, found := c.misses.Get(key); found {
-			c.opts.logger.Debug("miss cache hit")
-			return *new(T), ErrNotFound
-		}
+	defer c.spreads.exit()
+	if _, err := c.misses.Get(ctx, key); err == nil {
+		c.opts.logger.Debug("miss cache hit")
+		return *new(T), ErrNotFound
 	}
 	allNotFound := true
 	for idx, cache := range c.caches {
@@ -155,18 +137,17 @@ func (c CompositeCache[T]) Get(ctx context.Context, key string) (T, error) {
 		}
 		c.opts.logger.Debug("cache hit", "index", idx)
 		if idx > 0 {
-			select {
-			case c.ch <- spreadCommand[T]{key: key, value: v, idx: idx}:
+			if c.spreads.tryPush(spreadCommand[T]{key: key, value: v, idx: idx}) {
 				c.opts.logger.Debug("spread command sent", "index", idx)
-			default:
+			} else {
 				c.opts.logger.Warn("spread command dropped. Channel full", "index", idx)
 			}
 		}
 		return v, nil
 	}
 	// Only remember genuine misses: if a cache failed, the key may well exist there.
-	if c.misses != nil && allNotFound {
-		c.misses.SetWithTTL(key, struct{}{}, 1, c.opts.missCacheTTL)
+	if allNotFound {
+		_ = c.misses.Set(ctx, key, miss{}) // LocalCache.Set never fails
 	}
 	return *new(T), ErrNotFound
 }
@@ -174,32 +155,33 @@ func (c CompositeCache[T]) Get(ctx context.Context, key string) (T, error) {
 // Set sets the value for the given key. The value is spread to all caches, and any remembered miss for the key is
 // cleared.
 func (c CompositeCache[T]) Set(ctx context.Context, key string, value T) error {
-	c.state.mu.RLock()
-	defer c.state.mu.RUnlock()
-	if c.state.closed {
+	if !c.spreads.enter() {
 		return ErrClosed
 	}
-	if c.misses != nil {
-		c.misses.Del(key)
-	}
+	defer c.spreads.exit()
+	_ = c.misses.Delete(ctx, key) // LocalCache.Delete never fails
 	return c.spread(ctx, key, value, len(c.caches))
 }
 
-// startSpreadWorker starts a worker to spread cache updates. The worker exits once ch is closed and drained,
-// signalling completion by closing state.done.
-func (c CompositeCache[T]) startSpreadWorker(ch chan spreadCommand[T]) {
-	go func() {
-		defer close(c.state.done)
-		for cmd := range ch {
-			func(cmd spreadCommand[T]) {
-				ctx, cancel := context.WithTimeout(context.Background(), c.opts.spreadTimeout)
-				defer cancel()
-				if err := c.spread(ctx, cmd.key, cmd.value, cmd.idx); err != nil {
-					c.opts.logger.Error("could not spread cache", "err", err.Error())
-				}
-			}(cmd)
+// Delete removes key from every cache, and clears any remembered miss for it. Caches are cleared from the lowest
+// up, so that a concurrent Get cannot copy the value back up from a cache not yet cleared. Every cache is attempted,
+// and every error encountered is returned.
+//
+// A copy queued by an earlier Get, but not yet applied, can still put the value back into the upper caches until it
+// expires.
+func (c CompositeCache[T]) Delete(ctx context.Context, key string) error {
+	if !c.spreads.enter() {
+		return ErrClosed
+	}
+	defer c.spreads.exit()
+	var errs []error
+	for i := len(c.caches) - 1; i >= 0; i-- {
+		if err := c.caches[i].Delete(ctx, key); err != nil {
+			errs = append(errs, err)
 		}
-	}()
+	}
+	_ = c.misses.Delete(ctx, key) // LocalCache.Delete never fails
+	return errors.Join(errs...)
 }
 
 // spread spreads the value to caches up to the given index.
@@ -215,24 +197,15 @@ func (c CompositeCache[T]) spread(ctx context.Context, key string, value T, idx 
 // Close closes the cache. It waits for in-flight operations, drains pending spread commands, then closes all
 // caches, returning every error encountered. Calling Close more than once is a no-op.
 func (c CompositeCache[T]) Close(ctx context.Context) error {
-	c.state.mu.Lock()
-	if c.state.closed {
-		c.state.mu.Unlock()
+	closed, err := c.spreads.close(ctx)
+	if !closed {
 		return nil
 	}
-	c.state.closed = true
-	close(c.ch)
-	c.state.mu.Unlock()
-
-	select {
-	case <-c.state.done:
-	case <-ctx.Done():
-		c.opts.logger.Warn("timed out waiting for spread worker to drain", "err", ctx.Err())
+	if err != nil {
+		c.opts.logger.Warn("timed out waiting for spread worker to drain", "err", err)
 	}
 
-	if c.misses != nil {
-		c.misses.Close()
-	}
+	_ = c.misses.Close(ctx) // LocalCache.Close never fails
 	var errs []error
 	for _, cache := range c.caches {
 		if err := cache.Close(ctx); err != nil {
