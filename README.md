@@ -232,7 +232,14 @@ func main() {
 }
 ```
 
-`AllowN` counts several hits at once. With a `nil` counter, each replica limits on its own.
+`AllowN` counts several hits at once.
+
+For a single process, or when each replica should limit on its own, use `NewLocalLimiter`. It needs no `Counter`,
+and the options about sending hits (flush, fallback and key prefix) have no effect:
+
+```go
+limiter, err := jiffy.NewLocalLimiter(100, time.Minute)
+```
 
 #### How it limits
 

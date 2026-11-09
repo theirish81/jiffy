@@ -153,9 +153,16 @@ type Limiter struct {
 	now           func() time.Time
 }
 
+// NewLocalLimiter creates a sliding window rate limiter allowing up to limit hits per key in any window, counted in
+// this process only. Each replica limits on its own, so the effective global limit grows with the number of
+// replicas. Options about the Counter (flush, fallback and key prefix) have no effect.
+func NewLocalLimiter(limit int64, window time.Duration, options ...LimiterOption) (*Limiter, error) {
+	return NewLimiter(nil, limit, window, options...)
+}
+
 // NewLimiter creates a sliding window rate limiter allowing up to limit hits per key in any window.
 // counter shares hits between replicas, and is typically a RedisCache. Any Counter works, including a LocalCache;
-// a nil counter makes every replica limit on its own, without any background sends. The Limiter does not close the
+// a nil counter makes every replica limit on its own, as NewLocalLimiter does. The Limiter does not close the
 // counter.
 func NewLimiter(counter Counter, limit int64, window time.Duration, options ...LimiterOption) (*Limiter, error) {
 	if limit < 1 {

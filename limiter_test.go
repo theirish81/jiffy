@@ -277,6 +277,21 @@ func TestLimiter_InvalidArguments(t *testing.T) {
 	assert.True(t, d.Allowed)
 }
 
+func TestNewLocalLimiter(t *testing.T) {
+	_, err := NewLocalLimiter(0, time.Minute)
+	assert.Error(t, err)
+
+	l, err := NewLocalLimiter(2, time.Minute, quietLimiterLogger())
+	require.NoError(t, err)
+	defer l.Close(context.Background())
+	assert.Nil(t, l.counter)
+	for _, want := range []bool{true, true, false} {
+		d, err := l.Allow(context.Background(), "k")
+		require.NoError(t, err)
+		assert.Equal(t, want, d.Allowed)
+	}
+}
+
 func TestLimiter_Close(t *testing.T) {
 	counter, clock := newFakeCounter(), newFakeClock()
 	l, err := NewLimiter(counter, 10, time.Minute, quietLimiterLogger())
